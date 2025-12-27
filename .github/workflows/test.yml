@@ -1,0 +1,23 @@
+name: Test LLM Council
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      - name: Lint
+        run: |
+          pip install ruff
+          ruff check .
+      - name: Type check
+        run: |
+          pip install mypy
+          mypy council.py --ignore-missing-imports

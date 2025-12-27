@@ -1,0 +1,457 @@
+"""
+LLM Council System
+3 Agents generate independent answers
+2 Judges evaluate using a rubric
+Outputs structured Decision Object with audit trail
+"""
+
+import json
+import os
+from datetime import datetime
+from typing import List, Dict, Optional
+from enum import Enum
+from pathlib import Path
+
+from anthropic import Anthropic
+from pydantic import BaseModel, Field
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn
+
+console = Console()
+
+
+class SafetyLevel(str, Enum):
+    SAFE = "safe"
+    CAUTION = "caution"
+    BLOCKED = "blocked"
+
+
+class AgentResponse(BaseModel):
+    agent_id: str
+    response: str
+    timestamp: datetime
+    reasoning: str
+
+
+class JudgeEvaluation(BaseModel):
+    judge_id: str
+    scores: Dict[str, float]  # rubric dimension -> score
+    winner: str  # agent_id
+    reasoning: str
+    timestamp: datetime
+
+
+class DecisionObject(BaseModel):
+    question: str
+    final_answer: str
+    confidence: float = Field(ge=0, le=1)
+    risks: List[str]
+    citations: List[str]
+    safety_status: SafetyLevel
+    agent_responses: List[AgentResponse]
+    judge_evaluations: List[JudgeEvaluation]
+    metadata: Dict[str, any]
+    timestamp: datetime
+
+
+class SafetyGate:
+    """Pre-filter questions for safety concerns"""
+    
+    BLOCKED_PATTERNS = [
+        "how to make weapons",
+        "how to harm",
+        "illegal activities",
+        "exploit vulnerabilities",
+        "bypass security"
+    ]
+    
+    CAUTION_PATTERNS = [
+        "medical advice",
+        "legal advice",
+        "financial advice",
+        "privacy concerns"
+    ]
+    
+    @classmethod
+    def check(cls, question: str) -> tuple[SafetyLevel, List[str]]:
+        """Check question safety and return level + concerns"""
+        q_lower = question.lower()
+        risks = []
+        
+        for pattern in cls.BLOCKED_PATTERNS:
+            if pattern in q_lower:
+                risks.append(f"Blocked pattern detected: {pattern}")
+                return SafetyLevel.BLOCKED, risks
+        
+        for pattern in cls.CAUTION_PATTERNS:
+            if pattern in q_lower:
+                risks.append(f"Caution advised: {pattern}")
+        
+        if risks:
+            return SafetyLevel.CAUTION, risks
+        
+        return SafetyLevel.SAFE, []
+
+
+class AuditLog:
+    """Persistent audit trail for all council decisions"""
+    
+    def __init__(self, log_dir: str = "audit_logs"):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(exist_ok=True)
+    
+    def log_decision(self, decision: DecisionObject):
+        """Write decision to persistent log"""
+        timestamp = decision.timestamp.strftime("%Y%m%d_%H%M%S")
+        filename = self.log_dir / f"decision_{timestamp}.json"
+        
+        with open(filename, 'w') as f:
+            json.dump(decision.model_dump(mode='json'), f, indent=2, default=str)
+        
+        # Also append to master log
+        master_log = self.log_dir / "master_log.jsonl"
+        with open(master_log, 'a') as f:
+            f.write(json.dumps(decision.model_dump(mode='json'), default=str) + '\n')
+    
+    def get_recent_decisions(self, n: int = 10) -> List[DecisionObject]:
+        """Retrieve recent decisions"""
+        master_log = self.log_dir / "master_log.jsonl"
+        if not master_log.exists():
+            return []
+        
+        decisions = []
+        with open(master_log, 'r') as f:
+            lines = f.readlines()
+            for line in lines[-n:]:
+                data = json.loads(line)
+                decisions.append(DecisionObject(**data))
+        
+        return decisions
+
+
+class Agent:
+    """Individual agent that generates independent answers"""
+    
+    def __init__(self, agent_id: str, persona: str, client: Anthropic):
+        self.agent_id = agent_id
+        self.persona = persona
+        self.client = client
+    
+    def generate_answer(self, question: str) -> AgentResponse:
+        """Generate independent answer to question"""
+        
+        prompt = f"""You are {self.persona}.
+
+Answer this question independently: {question}
+
+Provide:
+1. Your direct answer
+2. Your reasoning
+3. Key sources or evidence (if applicable)
+
+Be concise but thorough."""
+
+        response = self.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        answer_text = response.content[0].text
+        
+        return AgentResponse(
+            agent_id=self.agent_id,
+            response=answer_text,
+            timestamp=datetime.now(),
+            reasoning=f"Generated using persona: {self.persona}"
+        )
+
+
+class Judge:
+    """Judge that compares agent answers using a rubric"""
+    
+    RUBRIC = {
+        "accuracy": "Factual correctness and precision",
+        "completeness": "Coverage of key aspects",
+        "clarity": "Clear and understandable explanation",
+        "reasoning": "Quality of logical reasoning"
+    }
+    
+    def __init__(self, judge_id: str, client: Anthropic):
+        self.judge_id = judge_id
+        self.client = client
+    
+    def evaluate(self, question: str, responses: List[AgentResponse]) -> JudgeEvaluation:
+        """Compare responses and select winner based on rubric"""
+        
+        responses_text = "\n\n".join([
+            f"Agent {r.agent_id}:\n{r.response}" 
+            for r in responses
+        ])
+        
+        rubric_text = "\n".join([
+            f"- {dim}: {desc}" 
+            for dim, desc in self.RUBRIC.items()
+        ])
+        
+        prompt = f"""Question: {question}
+
+Agent Responses:
+{responses_text}
+
+Evaluation Rubric:
+{rubric_text}
+
+Compare these responses and:
+1. Score each agent on each rubric dimension (0-10)
+2. Select the best overall response
+3. Explain your reasoning
+
+Format your response as JSON:
+{{
+  "scores": {{
+    "agent_1": {{"accuracy": X, "completeness": X, "clarity": X, "reasoning": X}},
+    "agent_2": {{"accuracy": X, "completeness": X, "clarity": X, "reasoning": X}},
+    "agent_3": {{"accuracy": X, "completeness": X, "clarity": X, "reasoning": X}}
+  }},
+  "winner": "agent_X",
+  "reasoning": "your explanation"
+}}"""
+
+        response = self.client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        result_text = response.content[0].text
+        
+        # Parse JSON from response
+        try:
+            # Extract JSON if wrapped in markdown
+            if "```json" in result_text:
+                result_text = result_text.split("```json")[1].split("```")[0]
+            elif "```" in result_text:
+                result_text = result_text.split("```")[1].split("```")[0]
+            
+            result = json.loads(result_text.strip())
+            
+            # Flatten scores for easier storage
+            flat_scores = {}
+            for agent_id, dims in result["scores"].items():
+                for dim, score in dims.items():
+                    flat_scores[f"{agent_id}_{dim}"] = score
+            
+            return JudgeEvaluation(
+                judge_id=self.judge_id,
+                scores=flat_scores,
+                winner=result["winner"],
+                reasoning=result["reasoning"],
+                timestamp=datetime.now()
+            )
+        except Exception as e:
+            console.print(f"[red]Error parsing judge response: {e}[/red]")
+            # Fallback evaluation
+            return JudgeEvaluation(
+                judge_id=self.judge_id,
+                scores={"fallback": 0},
+                winner=responses[0].agent_id,
+                reasoning=f"Fallback due to parsing error: {str(e)}",
+                timestamp=datetime.now()
+            )
+
+
+class LLMCouncil:
+    """Main council orchestrator"""
+    
+    def __init__(self, api_key: str):
+        self.client = Anthropic(api_key=api_key)
+        self.audit_log = AuditLog()
+        
+        # Initialize 3 agents with different personas
+        self.agents = [
+            Agent("agent_1", "a careful, detail-oriented analyst", self.client),
+            Agent("agent_2", "a creative problem-solver who thinks outside the box", self.client),
+            Agent("agent_3", "a pragmatic expert focused on practical solutions", self.client)
+        ]
+        
+        # Initialize 2 judges
+        self.judges = [
+            Judge("judge_1", self.client),
+            Judge("judge_2", self.client)
+        ]
+    
+    def deliberate(self, question: str) -> DecisionObject:
+        """Run full council deliberation process"""
+        
+        console.print(Panel.fit(
+            f"[bold cyan]Question:[/bold cyan] {question}",
+            title="LLM Council Deliberation"
+        ))
+        
+        # Safety gate
+        safety_level, safety_risks = SafetyGate.check(question)
+        
+        if safety_level == SafetyLevel.BLOCKED:
+            console.print("[bold red]❌ Question blocked by safety gate[/bold red]")
+            decision = DecisionObject(
+                question=question,
+                final_answer="Question blocked due to safety concerns.",
+                confidence=0.0,
+                risks=safety_risks,
+                citations=[],
+                safety_status=safety_level,
+                agent_responses=[],
+                judge_evaluations=[],
+                metadata={"blocked": True},
+                timestamp=datetime.now()
+            )
+            self.audit_log.log_decision(decision)
+            return decision
+        
+        if safety_level == SafetyLevel.CAUTION:
+            console.print("[yellow]⚠️  Proceeding with caution[/yellow]")
+        
+        # Step 1: Agents generate independent answers
+        console.print("\n[bold]Step 1: Agents generating answers...[/bold]")
+        agent_responses = []
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console
+        ) as progress:
+            for agent in self.agents:
+                task = progress.add_task(f"Agent {agent.agent_id}...", total=None)
+                response = agent.generate_answer(question)
+                agent_responses.append(response)
+                progress.remove_task(task)
+                console.print(f"✓ {agent.agent_id} completed")
+        
+        # Step 2: Judges evaluate
+        console.print("\n[bold]Step 2: Judges evaluating...[/bold]")
+        judge_evaluations = []
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console
+        ) as progress:
+            for judge in self.judges:
+                task = progress.add_task(f"Judge {judge.judge_id}...", total=None)
+                evaluation = judge.evaluate(question, agent_responses)
+                judge_evaluations.append(evaluation)
+                progress.remove_task(task)
+                console.print(f"✓ {judge.judge_id} completed")
+        
+        # Step 3: Synthesize decision
+        console.print("\n[bold]Step 3: Synthesizing final decision...[/bold]")
+        
+        # Count votes for winner
+        votes = {}
+        for eval in judge_evaluations:
+            votes[eval.winner] = votes.get(eval.winner, 0) + 1
+        
+        winner_id = max(votes, key=votes.get)
+        winner_response = next(r for r in agent_responses if r.agent_id == winner_id)
+        
+        # Calculate confidence based on judge agreement
+        confidence = votes[winner_id] / len(judge_evaluations)
+        
+        # Extract citations (simple heuristic: look for URLs or "according to")
+        citations = []
+        for response in agent_responses:
+            if "http" in response.response:
+                citations.append(f"Source mentioned by {response.agent_id}")
+            if "according to" in response.response.lower():
+                citations.append(f"Citation by {response.agent_id}")
+        
+        # Aggregate risks
+        all_risks = safety_risks.copy()
+        if confidence < 0.7:
+            all_risks.append(f"Low judge agreement (confidence: {confidence:.2f})")
+        
+        decision = DecisionObject(
+            question=question,
+            final_answer=winner_response.response,
+            confidence=confidence,
+            risks=all_risks if all_risks else ["No significant risks identified"],
+            citations=citations if citations else ["No explicit citations found"],
+            safety_status=safety_level,
+            agent_responses=agent_responses,
+            judge_evaluations=judge_evaluations,
+            metadata={
+                "winner": winner_id,
+                "votes": votes,
+                "judge_count": len(judge_evaluations),
+                "agent_count": len(agent_responses)
+            },
+            timestamp=datetime.now()
+        )
+        
+        # Log to audit trail
+        self.audit_log.log_decision(decision)
+        
+        return decision
+    
+    def print_decision(self, decision: DecisionObject):
+        """Pretty print decision object"""
+        
+        console.print("\n" + "="*80)
+        console.print(Panel.fit(
+            f"[bold green]Final Answer[/bold green]\n\n{decision.final_answer}",
+            title=f"Decision (Confidence: {decision.confidence:.1%})"
+        ))
+        
+        console.print(f"\n[bold]Safety Status:[/bold] {decision.safety_status.value.upper()}")
+        console.print(f"[bold]Confidence:[/bold] {decision.confidence:.1%}")
+        
+        console.print(f"\n[bold]Risks:[/bold]")
+        for risk in decision.risks:
+            console.print(f"  • {risk}")
+        
+        console.print(f"\n[bold]Citations:[/bold]")
+        for citation in decision.citations:
+            console.print(f"  • {citation}")
+        
+        console.print(f"\n[bold]Metadata:[/bold]")
+        console.print(f"  Winner: {decision.metadata['winner']}")
+        console.print(f"  Votes: {decision.metadata['votes']}")
+        
+        console.print("\n" + "="*80)
+
+
+def main():
+    """Example usage"""
+    
+    # Load API key
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        console.print("[red]Error: ANTHROPIC_API_KEY not found in environment[/red]")
+        console.print("Please set it in .env file or export it")
+        return
+    
+    # Initialize council
+    council = LLMCouncil(api_key)
+    
+    # Example questions
+    questions = [
+        "What are the key differences between supervised and unsupervised learning?",
+        "Should companies prioritize rapid growth or sustainable profitability?",
+        "What are the most promising applications of AI in healthcare?"
+    ]
+    
+    console.print("[bold cyan]LLM Council System Demo[/bold cyan]\n")
+    
+    for i, question in enumerate(questions, 1):
+        console.print(f"\n[bold yellow]Question {i}/{len(questions)}[/bold yellow]")
+        decision = council.deliberate(question)
+        council.print_decision(decision)
+        
+        if i < len(questions):
+            input("\nPress Enter to continue to next question...")
+
+
+if __name__ == "__main__":
+    main()
