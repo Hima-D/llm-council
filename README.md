@@ -1,3 +1,12 @@
+---
+title: LLM Council
+emoji: 🏛️
+colorFrom: blue
+colorTo: indigo
+sdk: gradio
+app_file: app.py
+license: mit
+---
 # 🏛️ LLM Council System
 
 A production-ready multi-agent AI system where 3 agents independently generate answers and 2 judges evaluate them using a structured rubric. Features safety gating, persistent audit logs, and advanced reflection capabilities.
