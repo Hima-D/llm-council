@@ -502,12 +502,7 @@ MIT License - see LICENSE file
 ## 👤 Author
 
 **Himanshu**  
-Built for Aonxi Interview Challenge
 
-- GitHub: [@yourusername](https://github.com/yourusername)
-- Email: your.email@example.com
-
----
 
 ## 🙏 Acknowledgments
 
