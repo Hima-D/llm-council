@@ -526,7 +526,7 @@ MIT License - see LICENSE file
 ## 📞 Support
 
 For questions or issues:
-1. Check [Issues](https://github.com/yourusername/llm-council/issues)
+1. Check [Issues](https://github.com/e/llm-council/issues)
 2. Read the [FAQ](#faq)
 3. Contact: origin@aonxi.com
 
